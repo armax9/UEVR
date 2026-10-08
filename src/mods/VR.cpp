@@ -3142,9 +3142,21 @@ Vector2f VR::get_joystick_axis(vr::VRInputValueHandle_t handle) const {
 
         return out;
     } else if (get_runtime()->is_openxr()) {
+        // This experimental Wine/CrossOver build corrects the reported stick axes by default.
+        static const bool fix_stick_axes = []() {
+            char value[8]{};
+            GetEnvironmentVariableA("UEVR_OPENXR_STICK_FIX", value, sizeof(value));
+            const bool enabled = value[0] == '\0' || value[0] == '1';
+            spdlog::info("OpenXR stick axis workaround: {} (left X/Y, right X)", enabled);
+            return enabled;
+        }();
         // Not using get_left/right_joystick here because it flips the controllers
         if (handle == m_left_joystick) {
             auto out = m_openxr->get_left_stick_axis();
+            if (fix_stick_axes) {
+                out.x = -out.x;
+                out.y = -out.y;
+            }
             //return glm::length(out) > m_joystick_deadzone->value() ? out : Vector2f{};
             // okay.. instead of that actually clamp x/y to the proper deadzone
             if (glm::abs(out.x) < m_joystick_deadzone->value()) {
@@ -3158,6 +3170,9 @@ Vector2f VR::get_joystick_axis(vr::VRInputValueHandle_t handle) const {
             return out;
         } else if (handle == m_right_joystick) {
             auto out = m_openxr->get_right_stick_axis();
+            if (fix_stick_axes) {
+                out.x = -out.x;
+            }
             //return glm::length(out) > m_joystick_deadzone->value() ? out : Vector2f{};
 
             if (glm::abs(out.x) < m_joystick_deadzone->value()) {
