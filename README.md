@@ -1,6 +1,6 @@
 > **Experimental Wine/CrossOver branch.** See [WINE-CROSSOVER.md](WINE-CROSSOVER.md)
 > for installation, build instructions, validation and known limitations.
-> D3D11/OpenXR initialization was tested in Call of the Sea; DX12 VR is not fixed.
+> User-reported VR tests: Call of the Sea (D3D11) and Hogwarts Legacy (D3D12).
 
 # UEVR ![build](https://github.com/praydog/UEVR/actions/workflows/dev-release.yml/badge.svg)
 
