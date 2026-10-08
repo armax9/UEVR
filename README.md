@@ -1,3 +1,7 @@
+> **Experimental Wine/CrossOver branch.** See [WINE-CROSSOVER.md](WINE-CROSSOVER.md)
+> for installation, build instructions, validation and known limitations.
+> D3D11/OpenXR initialization was tested in Call of the Sea; DX12 VR is not fixed.
+
 # UEVR ![build](https://github.com/praydog/UEVR/actions/workflows/dev-release.yml/badge.svg)
 
 Universal Unreal Engine VR Mod (4/5)
