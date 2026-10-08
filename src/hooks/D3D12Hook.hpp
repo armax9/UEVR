@@ -2,6 +2,9 @@
 
 #include <iostream>
 #include <functional>
+#include <mutex>
+#include <vector>
+#include <wrl/client.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -111,6 +114,21 @@ protected:
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
     UINT m_render_height{ NULL };
+
+    // Submission capture is a fallback for runtimes with opaque DXGI objects.
+    struct SubmittedQueue {
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+        DWORD thread_id{};
+    };
+    std::mutex m_submission_mutex;
+    std::vector<SubmittedQueue> m_submitted_queues;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_captured_queue;
+    std::unique_ptr<PointerHook> m_execute_hook;
+    bool m_using_submission_capture{false};
+    bool m_queue_wait_logged{false};
+    static void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue* queue,
+        UINT count, ID3D12CommandList* const* lists);
+    bool select_submitted_queue(ID3D12Device* device);
 
     uint32_t m_command_queue_offset{};
     uint32_t m_proton_swapchain_offset{};

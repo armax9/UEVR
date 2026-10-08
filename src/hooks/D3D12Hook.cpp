@@ -352,8 +352,11 @@ bool D3D12Hook::hook() {
     }
 
     if (m_command_queue_offset == 0) {
-        spdlog::error("Failed to find command queue offset");
-        return false;
+        spdlog::warn("DX12 queue capture: offset unavailable; capturing ExecuteCommandLists instead");
+        m_using_submission_capture = true;
+        auto& execute_fn = (*(void***)command_queue)[10];
+        m_execute_hook = std::make_unique<PointerHook>(&execute_fn,
+            (void*)&D3D12Hook::execute_command_lists);
     }
 
     try {
@@ -371,6 +374,8 @@ bool D3D12Hook::hook() {
         m_hooked = true;
     } catch (const std::exception& e) {
         spdlog::error("Failed to initialize hooks: {}", e.what());
+        m_execute_hook.reset();
+        m_using_submission_capture = false;
         m_hooked = false;
     }
 
@@ -401,10 +406,100 @@ bool D3D12Hook::unhook() {
     m_present_hook.reset();
     m_present1_hook.reset();
     m_swapchain_hook.reset();
+    m_execute_hook.reset();
+    {
+        std::lock_guard<std::mutex> lock(m_submission_mutex);
+        m_submitted_queues.clear();
+        m_captured_queue.Reset();
+    }
+    m_using_submission_capture = false;
+    m_queue_wait_logged = false;
+    m_command_queue = nullptr;
 
     m_hooked = false;
     m_is_phase_1 = true;
 
+    return true;
+}
+
+// This also observes queues created before injection. Keep references while hooked.
+void STDMETHODCALLTYPE D3D12Hook::execute_command_lists(ID3D12CommandQueue* queue,
+    UINT count, ID3D12CommandList* const* lists) {
+    auto* hook = g_d3d12_hook;
+    auto original = hook->m_execute_hook->get_original<decltype(&D3D12Hook::execute_command_lists)>();
+    original(queue, count, lists);
+    if (count == 0 || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(hook->m_submission_mutex);
+    for (auto& entry : hook->m_submitted_queues) {
+        if (entry.queue.Get() == queue) {
+            entry.thread_id = GetCurrentThreadId();
+            return;
+        }
+    }
+    SubmittedQueue entry;
+    entry.queue = queue;
+    entry.thread_id = GetCurrentThreadId();
+    hook->m_submitted_queues.push_back(std::move(entry));
+    spdlog::info("DX12 queue capture: observed DIRECT queue={:x}, thread={}",
+        (uintptr_t)queue, GetCurrentThreadId());
+}
+
+bool D3D12Hook::select_submitted_queue(ID3D12Device* device) {
+    // D3DMetal rejects IID_IUnknown here; compare the same supported device
+    // interface on both objects. A mismatch remains a reason to wait.
+    Microsoft::WRL::ComPtr<ID3D12Device> device_identity;
+    const auto identity_result = device->QueryInterface(IID_PPV_ARGS(device_identity.GetAddressOf()));
+    if (FAILED(identity_result)) {
+        if (!m_queue_wait_logged) {
+            spdlog::warn("DX12 queue device: present device ID3D12Device HRESULT={:08x}", (uint32_t)identity_result);
+        }
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_submission_mutex);
+    ID3D12CommandQueue* sole_queue = nullptr;
+    ID3D12CommandQueue* thread_queue = nullptr;
+    size_t matching_count = 0;
+    size_t thread_count = 0;
+    for (auto& entry : m_submitted_queues) {
+        Microsoft::WRL::ComPtr<ID3D12Device> queue_device;
+        Microsoft::WRL::ComPtr<ID3D12Device> queue_identity;
+        const auto device_result = entry.queue->GetDevice(IID_PPV_ARGS(queue_device.GetAddressOf()));
+        const auto queue_identity_result = SUCCEEDED(device_result) ?
+            queue_device->QueryInterface(IID_PPV_ARGS(queue_identity.GetAddressOf())) : device_result;
+        if (!m_queue_wait_logged) {
+            spdlog::info("DX12 queue device3: queue={:x}, GetDevice HRESULT={:08x}, identity HRESULT={:08x}, queue_identity={:x}, present_identity={:x}, submit_thread={}, present_thread={}",
+                (uintptr_t)entry.queue.Get(), (uint32_t)device_result, (uint32_t)queue_identity_result,
+                (uintptr_t)queue_identity.Get(), (uintptr_t)device_identity.Get(), entry.thread_id, GetCurrentThreadId());
+        }
+        if (FAILED(queue_identity_result) || queue_identity.Get() != device_identity.Get()) {
+            continue;
+        }
+        sole_queue = entry.queue.Get();
+        ++matching_count;
+        if (entry.thread_id == GetCurrentThreadId()) {
+            thread_queue = entry.queue.Get();
+            ++thread_count;
+        }
+    }
+    auto* selected = thread_count == 1 ? thread_queue :
+        (matching_count == 1 ? sole_queue : nullptr);
+    if (selected == nullptr) {
+        if (!m_queue_wait_logged) {
+            spdlog::warn("DX12 queue device: observed={}, matching_device={}, matching_thread={}",
+                m_submitted_queues.size(), matching_count, thread_count);
+        }
+        return false;
+    }
+    if (m_captured_queue.Get() != selected) {
+        m_captured_queue = selected;
+        spdlog::info("DX12 queue capture: selected queue={:x}, device={:x}, same_thread={}",
+            (uintptr_t)selected, (uintptr_t)device, thread_count == 1);
+        spdlog::default_logger()->flush();
+    }
+    m_command_queue = m_captured_queue.Get();
+    m_queue_wait_logged = false;
     return true;
 }
 
@@ -443,6 +538,26 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
         }
     }
 
+    if (d3d12->m_using_submission_capture) {
+        Microsoft::WRL::ComPtr<ID3D12Device> present_device;
+        const auto device_result = swap_chain->GetDevice(IID_PPV_ARGS(present_device.GetAddressOf()));
+        if (!d3d12->m_queue_wait_logged && d3d12->m_is_phase_1) {
+            Microsoft::WRL::ComPtr<ID3D12Device4> device4;
+            const auto device4_result = SUCCEEDED(device_result) ?
+                present_device->QueryInterface(IID_PPV_ARGS(device4.GetAddressOf())) : device_result;
+            spdlog::info("DX12 queue device: swapchain={:x}, GetDevice(base) HRESULT={:08x}, QueryInterface(Device4) HRESULT={:08x}",
+                (uintptr_t)swap_chain, (uint32_t)device_result, (uint32_t)device4_result);
+        }
+        if (FAILED(device_result) || !d3d12->select_submitted_queue(present_device.Get())) {
+            if (!d3d12->m_queue_wait_logged) {
+                spdlog::warn("DX12 queue capture: waiting for an unambiguous DIRECT queue on the presenting device");
+                spdlog::default_logger()->flush();
+                d3d12->m_queue_wait_logged = true;
+            }
+            return present_fn(swap_chain, sync_interval, flags, params);
+        }
+    }
+
     if (d3d12->m_is_phase_1) {
         //d3d12->m_present_hook.reset();
         d3d12->m_swapchain_hook.reset();
@@ -463,7 +578,7 @@ HRESULT D3D12Hook::present_internal(IDXGISwapChain3* swap_chain, UINT sync_inter
 
     swap_chain->GetDevice(IID_PPV_ARGS(&d3d12->m_device));
 
-    if (d3d12->m_device != nullptr) {
+    if (d3d12->m_device != nullptr && !d3d12->m_using_submission_capture) {
         if (d3d12->m_using_proton_swapchain) {
             const auto real_swapchain = *(uintptr_t*)((uintptr_t)swap_chain + d3d12->m_proton_swapchain_offset);
             d3d12->m_command_queue = *(ID3D12CommandQueue**)(real_swapchain + d3d12->m_command_queue_offset);
