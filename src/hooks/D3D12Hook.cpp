@@ -56,8 +56,28 @@ bool D3D12Hook::hook() {
 
     spdlog::info("Creating dummy device");
 
-    // Get the original on-disk bytes of the D3D12CreateDevice export
-    const auto original_bytes = utility::get_original_bytes(d3d12_create_device);
+    // This experimental Wine/CrossOver build preserves the runtime export by default.
+    char preserve_export_value[8]{};
+    GetEnvironmentVariableA("UEVR_D3D12_PRESERVE_EXPORT", preserve_export_value, sizeof(preserve_export_value));
+    const bool preserve_export = preserve_export_value[0] == '\0' || preserve_export_value[0] == '1';
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(d3d12_module, module_path, MAX_PATH);
+    spdlog::info("D3D12 diagnostic: module={}, export={:x}, preserve_export={}",
+        module_path, (uintptr_t)d3d12_create_device, preserve_export);
+    spdlog::default_logger()->flush();
+
+    // Set UEVR_D3D12_PRESERVE_EXPORT=0 to restore the upstream behavior.
+    const auto original_bytes = preserve_export ? decltype(utility::get_original_bytes(d3d12_create_device)){} :
+        utility::get_original_bytes(d3d12_create_device);
+    const auto create_dummy_device = [&]() {
+        spdlog::info("D3D12 diagnostic: entering D3D12CreateDevice (default adapter)");
+        spdlog::default_logger()->flush();
+        const auto result = d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device));
+        spdlog::info("D3D12 diagnostic: D3D12CreateDevice returned HRESULT={:08x}, device={:x}",
+            (uint32_t)result, (uintptr_t)device);
+        spdlog::default_logger()->flush();
+        return result;
+    };
 
     // Temporarily unhook D3D12CreateDevice
     // it allows compatibility with ReShade and other overlays that hook it
@@ -71,7 +91,7 @@ bool D3D12Hook::hook() {
         ProtectionOverride protection_override{ d3d12_create_device, original_bytes->size(), PAGE_EXECUTE_READWRITE };
         memcpy(d3d12_create_device, original_bytes->data(), original_bytes->size());
         
-        if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
+        if (FAILED(create_dummy_device())) {
             spdlog::error("Failed to create D3D12 Dummy device");
             memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
             return false;
@@ -80,7 +100,7 @@ bool D3D12Hook::hook() {
         spdlog::info("Restoring hooked bytes for D3D12CreateDevice");
         memcpy(d3d12_create_device, hooked_bytes.data(), hooked_bytes.size());
     } else { // D3D12CreateDevice is not hooked
-        if (FAILED(d3d12_create_device(nullptr, feature_level, IID_PPV_ARGS(&device)))) {
+        if (FAILED(create_dummy_device())) {
             spdlog::error("Failed to create D3D12 Dummy device");
             return false;
         }
@@ -248,6 +268,9 @@ bool D3D12Hook::hook() {
     }
 
     spdlog::info("Finding command queue offset");
+    spdlog::info("D3D12 diagnostic: swapchain1={:x}, swapchain3={:x}, queue={:x}",
+        (uintptr_t)swap_chain1, (uintptr_t)swap_chain, (uintptr_t)command_queue);
+    spdlog::default_logger()->flush();
 
     m_command_queue_offset = 0;
 

@@ -41,7 +41,85 @@ bool D3D11Hook::hook() {
     swap_chain_desc.BufferDesc.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
     swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    const auto original_bytes = utility::get_original_bytes(&D3D11CreateDeviceAndSwapChain);
+    char compatibility_value[8]{};
+    GetEnvironmentVariableA("UEVR_D3D11_COMPAT", compatibility_value, sizeof(compatibility_value));
+    const bool compatibility_mode = compatibility_value[0] == '\0' || compatibility_value[0] == '1';
+    const auto driver_type = compatibility_mode ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_NULL;
+    spdlog::info("D3D11 diagnostic: compatibility_mode={}, driver_type={}", compatibility_mode, (int)driver_type);
+    const auto create_dummy_device = [&]() -> HRESULT {
+        if (compatibility_mode) {
+            struct TemporaryResources {
+                HWND window{};
+                IDXGIDevice* dxgi_device{};
+                IDXGIAdapter* adapter{};
+                IDXGIFactory* factory{};
+                ~TemporaryResources() {
+                    if (factory) factory->Release();
+                    if (adapter) adapter->Release();
+                    if (dxgi_device) dxgi_device->Release();
+                    if (window) DestroyWindow(window);
+                }
+            } temporary;
+            const auto report = [](const char* stage, HRESULT result) {
+                spdlog::info("D3D11 split diagnostic: {} HRESULT={:08x}", stage, (uint32_t)result);
+                spdlog::default_logger()->flush();
+            };
+            spdlog::info("D3D11 split diagnostic: entering D3D11CreateDevice (hardware)");
+            spdlog::default_logger()->flush();
+            auto result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                &feature_level, 1, D3D11_SDK_VERSION, &device, nullptr, &context);
+            report("D3D11CreateDevice", result);
+            if (FAILED(result)) return result;
+
+            // Preserve the device/context only if the entire initialization succeeds.
+            const auto fail = [&](HRESULT error) {
+                if (context) { context->Release(); context = nullptr; }
+                if (device) { device->Release(); device = nullptr; }
+                return error;
+            };
+            temporary.window = CreateWindowExW(0, L"STATIC", L"UEVR D3D11 diagnostic",
+                WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!temporary.window) {
+                const auto error = GetLastError();
+                spdlog::error("D3D11 split diagnostic: CreateWindowExW failed, Win32={}", error);
+                spdlog::default_logger()->flush();
+                return fail(error ? HRESULT_FROM_WIN32(error) : E_FAIL);
+            }
+            swap_chain_desc.OutputWindow = temporary.window;
+            swap_chain_desc.BufferDesc.Width = 64;
+            swap_chain_desc.BufferDesc.Height = 64;
+            spdlog::info("D3D11 split diagnostic: querying IDXGIDevice");
+            spdlog::default_logger()->flush();
+            result = device->QueryInterface(IID_PPV_ARGS(&temporary.dxgi_device));
+            report("QueryInterface IDXGIDevice", result);
+            if (FAILED(result)) return fail(result);
+            result = temporary.dxgi_device->GetAdapter(&temporary.adapter);
+            report("GetAdapter", result);
+            if (FAILED(result)) return fail(result);
+            result = temporary.adapter->GetParent(IID_PPV_ARGS(&temporary.factory));
+            report("GetParent IDXGIFactory", result);
+            if (FAILED(result)) return fail(result);
+            spdlog::info("D3D11 split diagnostic: entering IDXGIFactory::CreateSwapChain (private window)");
+            spdlog::default_logger()->flush();
+            result = temporary.factory->CreateSwapChain(device, &swap_chain_desc, &swap_chain);
+            report("CreateSwapChain", result);
+            if (FAILED(result)) return fail(result);
+            spdlog::info("D3D11 split diagnostic: initialization succeeded, device={:x}, swapchain={:x}",
+                (uintptr_t)device, (uintptr_t)swap_chain);
+            spdlog::default_logger()->flush();
+            return result;
+        }
+        spdlog::info("D3D11 diagnostic: entering D3D11CreateDeviceAndSwapChain");
+        spdlog::default_logger()->flush();
+        const auto result = D3D11CreateDeviceAndSwapChain(nullptr, driver_type, nullptr, 0,
+            &feature_level, 1, D3D11_SDK_VERSION, &swap_chain_desc, &swap_chain, &device, nullptr, &context);
+        spdlog::info("D3D11 diagnostic: HRESULT={:08x}, device={:x}, swapchain={:x}",
+            (uint32_t)result, (uintptr_t)device, (uintptr_t)swap_chain);
+        spdlog::default_logger()->flush();
+        return result;
+    };
+    const auto original_bytes = compatibility_mode ? decltype(utility::get_original_bytes(&D3D11CreateDeviceAndSwapChain)){} :
+        utility::get_original_bytes(&D3D11CreateDeviceAndSwapChain);
 
     // Temporarily unhook D3D11CreateDeviceAndSwapChain
     // it allows compatibility with ReShade and other overlays that hook it
@@ -55,8 +133,7 @@ bool D3D11Hook::hook() {
         ProtectionOverride protection_override{ &D3D11CreateDeviceAndSwapChain, original_bytes->size(), PAGE_EXECUTE_READWRITE };
         memcpy(&D3D11CreateDeviceAndSwapChain, original_bytes->data(), original_bytes->size());
         
-        if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_NULL, nullptr, 0, &feature_level, 1, D3D11_SDK_VERSION,
-                &swap_chain_desc, &swap_chain, &device, nullptr, &context))) 
+        if (FAILED(create_dummy_device()))
         {
             spdlog::error("Failed to create D3D11 device");
             memcpy(&D3D11CreateDeviceAndSwapChain, hooked_bytes.data(), hooked_bytes.size());
@@ -66,8 +143,7 @@ bool D3D11Hook::hook() {
         spdlog::info("Restoring hooked bytes for D3D11CreateDeviceAndSwapChain");
         memcpy(&D3D11CreateDeviceAndSwapChain, hooked_bytes.data(), hooked_bytes.size());
     } else {
-        if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_NULL, nullptr, 0, &feature_level, 1, D3D11_SDK_VERSION,
-                &swap_chain_desc, &swap_chain, &device, nullptr, &context))) 
+        if (FAILED(create_dummy_device()))
         {
             spdlog::error("Failed to create D3D11 device");
             return false;
